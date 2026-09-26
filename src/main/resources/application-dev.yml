@@ -13,6 +13,12 @@ spring:
       discovery:
         locator:
           enabled: false
+  # 仅 apigw.accesslog.enabled=true 时才会去连库；关闭时下面这些完全不被读取
+  datasource:
+    url: ${ACCESSLOG_DB_URL:jdbc:mysql://localhost:3306/apigw?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&rewriteBatchedStatements=true}
+    username: ${ACCESSLOG_DB_USER:root}
+    password: ${ACCESSLOG_DB_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
 
 server:
   port: ${SERVER_PORT:8080}
@@ -26,6 +32,15 @@ apigw:
     route-refresh-interval: 10s
     # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
     route-refresh-interval-ms: 10000
+  # 访问流水落库。本地默认关闭（无库也能起网关、跑转发）；生产置 true 并给数据源。
+  # 攒批边界：500 条一批、最多等 2s 落一次；入口队列 2 万，满则丢日志计数、绝不反压转发；
+  # 正常退出最多等 10s 把手里批次 flush 完。
+  accesslog:
+    enabled: ${ACCESSLOG_ENABLED:false}
+    batch-size: 500
+    flush-interval: 2s
+    queue-capacity: 20000
+    shutdown-await: 10s
 
 logging:
   level:

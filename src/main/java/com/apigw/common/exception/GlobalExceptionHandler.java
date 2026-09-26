@@ -3,9 +3,10 @@ package com.apigw.common.exception;
 import com.apigw.common.Result;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.validation.FieldError;
-import org.springframework.web.bind.support.WebExchangeBindException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.bind.support.WebExchangeBindException;
+import org.springframework.web.server.MissingRequestValueException;
 import reactor.core.publisher.Mono;
 
 /**
@@ -31,6 +32,14 @@ public class GlobalExceptionHandler {
         String msg = error == null ? "参数校验失败" : error.getDefaultMessage();
         log.warn("参数校验失败 field={} msg={}", error == null ? "-" : error.getField(), msg);
         return Mono.just(Result.fail(msg));
+    }
+
+    /** 缺必填参数（@RequestParam 没给）：统一成 code=1 + 明确提示，别把 500 抛给调用方。 */
+    @ExceptionHandler(MissingRequestValueException.class)
+    public Mono<Result<Void>> handleMissingParam(MissingRequestValueException e) {
+        String name = e.getReason() != null ? e.getReason() : "必填参数";
+        log.warn("缺少请求参数：{}", name);
+        return Mono.just(Result.fail("缺少必填参数：" + name));
     }
 
     @ExceptionHandler(Exception.class)

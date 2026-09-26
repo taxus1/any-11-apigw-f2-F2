@@ -1,5 +1,9 @@
 package com.apigw.proxy;
 
+import com.apigw.common.web.ClientIpResolver;
+import com.apigw.common.web.GatewayHeaders;
+import com.apigw.domain.accesslog.AccessLogEntry;
+import com.apigw.domain.accesslog.AccessLogSink;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.proxy.accesslog.AccessLogRecorder;
 import com.apigw.proxy.action.HeaderActionApplier;
@@ -22,25 +26,30 @@ import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
+import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 转发链路的总编排（一个高优先级 WebFilter）。整条路：
  *
  *   请求进来
- *     → 生成 traceId，先记访问日志第 1 段
+ *     → 定请求编号（沿用调用方 X-Trace-Id，没带就生成），建这笔请求专属的
+ *       流水持有者（进来段：编号/应用/来源/方法/路径/发生时间），并先记文件审计第 1 段
  *     → 从路由快照里按配好的条件匹配唯一路由（匹配不到 → 404 NO_ROUTE）
  *     → 转发器里按顺序号执行请求类动作，打到上游
  *     → 上游响应回来：清洗逐跳/报文绑定头，按顺序号执行响应类动作
- *     → 状态码与响应体交回调用方，记访问日志第 2 段
+ *     → 状态码与响应体交回调用方，在持有者上补齐第二段（命中路由/最终状态码/总耗时），
+ *       一行完整流水异步入库，并记文件审计第 2 段
  *
  * 任何一步出岔子都由 {@link #fail} 收口成网关自己的 JSON 答复：
  * 内部堆栈、上游原始错误页一律不往外抛；404/502/504/503 四类错误的状态码、
  * X-Gateway-Error 头、响应体 error 码三者齐备且互不相同。
+ *
+ * 流水并发安全：流水持有者是这笔请求自己的局部对象（不是按 traceId 共享的 Map），
+ * 进来段和回去段改的是同一份，再高并发也不会把 A 的路径配到 B 的状态码。
  *
  * 管理接口（/api 开头）不属转发流量，直接放给后面的 Controller/SCG，不参与匹配。
  */
@@ -66,17 +75,20 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
     private final RouteMatcher routeMatcher;
     private final UpstreamForwarder forwarder;
     private final AccessLogRecorder accessLog;
+    private final AccessLogSink accessLogSink;
     private final ObjectMapper objectMapper;
 
     public GatewayProxyWebFilter(RouteCatalog routeCatalog,
                                  RouteMatcher routeMatcher,
                                  UpstreamForwarder forwarder,
                                  AccessLogRecorder accessLog,
+                                 AccessLogSink accessLogSink,
                                  ObjectMapper objectMapper) {
         this.routeCatalog = routeCatalog;
         this.routeMatcher = routeMatcher;
         this.forwarder = forwarder;
         this.accessLog = accessLog;
+        this.accessLogSink = accessLogSink;
         this.objectMapper = objectMapper;
     }
 
@@ -92,10 +104,23 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
             return chain.filter(exchange);
         }
 
-        String traceId = newTraceId();
+        // 请求编号：调用方带了合法 X-Trace-Id 就沿用（跨服务能串起来），没带/非法我们生成
+        String incomingTraceId = GatewayHeaders.normalizeTraceId(
+                exchange.getRequest().getHeaders().getFirst(GatewayHeaders.TRACE_ID_HEADER));
+        final String traceId = incomingTraceId != null
+                ? incomingTraceId : GatewayHeaders.newRequestId();
         long startNanos = System.nanoTime();
         String method = exchange.getRequest().getMethod() == null
                 ? "-" : exchange.getRequest().getMethod().name();
+
+        // 流水第一段在请求一进来就固定下来：应用编号、来源地址（与鉴权/限流同一口径）、
+        // 方法、路径、发生时刻。持有者是这笔请求自己的局部对象（响应式链闭包持有），
+        // 高并发下每笔请求各有一份，回去段只补自己那份，天然不会串
+        String appNo = GatewayHeaders.normalizeAppNo(
+                exchange.getRequest().getHeaders().getFirst(GatewayHeaders.APP_NO_HEADER));
+        String clientIp = ClientIpResolver.resolve(exchange.getRequest());
+        AccessLogEntry accessEntry = AccessLogEntry.incoming(
+                traceId, appNo, clientIp, method, path, Instant.now());
 
         // 记账用的「这次到底怎样了」：无论从哪个分支结束，doFinally 都拿它写唯一一条 OUT 日志，
         // 避免成功记一遍、失败又记一遍，让同一次请求在审计里出现两条结果
@@ -136,11 +161,27 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                 })
                 .doFinally(sig -> {
                     Outcome o = outcome.get();
+                    // 状态码取「最终回给调用方的状态」：上游透传码、或网关合成的 404/502/504/503；
+                    // 状态行写出前连接就断、一个码都没产出时为 0（语义：未产生状态码，列不留 NULL）
                     int status = exchange.getResponse().getStatusCode() == null
                             ? 0 : exchange.getResponse().getStatusCode().value();
+                    long elapsed = elapsedMillis(startNanos);
                     accessLog.logOutcome(traceId, method, path, o.routeNo(), o.upstream(),
-                            status, o.result(), elapsedMillis(startNanos));
+                            status, o.result(), elapsed);
+
+                    // 同一持有者补齐第二段 → 完整一行异步入库（只做一次非阻塞入队，不卡响应）
+                    safeRecord(accessEntry.complete(o.routeNo(), status, elapsed));
                 });
+    }
+
+    /** 入落库出口再兜一层：出口契约是不抛异常，这里也不允许任何意外碰到转发收尾。 */
+    private void safeRecord(AccessLogEntry entry) {
+        try {
+            accessLogSink.record(entry);
+        } catch (Exception e) {
+            log.warn("访问流水入队失败 requestId={}（不影响转发）：{}",
+                    entry.requestId(), e.toString());
+        }
     }
 
     /**
@@ -192,10 +233,6 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
             }
         }
         return false;
-    }
-
-    private static String newTraceId() {
-        return UUID.randomUUID().toString().replace("-", "");
     }
 
     /** 上游状态码原样透传；非标准码（resolve 返回 null）退化成 502，不让框架抛异常。 */

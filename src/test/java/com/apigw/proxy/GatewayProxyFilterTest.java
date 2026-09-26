@@ -47,6 +47,10 @@ class GatewayProxyFilterTest {
     private InMemoryRouteStore store;
     private RouteCatalog catalog;
 
+    /** 落库出口在测试里用同步收集器替身：不引 JDBC，直接抓住每笔完整流水做断言。 */
+    private final java.util.List<com.apigw.domain.accesslog.AccessLogEntry> recordedEntries =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
     private DisposableServer server;
     private String baseUrl;
     private WebClient client;
@@ -71,7 +75,7 @@ class GatewayProxyFilterTest {
 
         var filter = new GatewayProxyWebFilter(
                 catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
-                new AccessLogRecorder(), new ObjectMapper());
+                new AccessLogRecorder(), e -> recordedEntries.add(e), new ObjectMapper());
 
         // 链尾 WebHandler：到这里的只有被判定为非转发流量（/api），回一个占位 200
         WebHandler tail = exchange -> {
@@ -344,5 +348,104 @@ class GatewayProxyFilterTest {
         // 不同请求的 traceId 不能串
         assertThat(traceOk).isNotEqualTo(traceErr);
         notFound.releaseBody().block();
+    }
+
+    @Test
+    void callerTraceId_isHonored_andBecomesRequestIdOfAccessRow() {
+        loadRoutes(route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of()));
+
+        var resp = client.get().uri(baseUrl + "/order/9")
+                .header("X-Trace-Id", "caller-trace-001")
+                .header("X-App-No", "app-billing")
+                .exchange().block();
+        // 沿用调用方的号，响应头也能对上，跨服务可串联
+        assertThat(resp.headers().asHttpHeaders().getFirst("X-Gateway-Trace-Id"))
+                .isEqualTo("caller-trace-001");
+        resp.releaseBody().block();
+
+        com.apigw.domain.accesslog.AccessLogEntry row = awaitRow("caller-trace-001");
+        assertThat(row.statusCode()).isEqualTo(200);
+        assertThat(row.routeNo()).isEqualTo("order");
+        assertThat(row.appNo()).isEqualTo("app-billing");
+        assertThat(row.method()).isEqualTo("GET");
+        assertThat(row.path()).isEqualTo("/order/9");
+        assertThat(row.elapsedMs()).isGreaterThanOrEqualTo(0);
+        assertThat(row.clientIp()).isNotBlank();
+    }
+
+    @Test
+    void illegalCallerTraceId_isIgnored_gatewayGeneratesOne() {
+        loadRoutes(route("order", upstream.baseUrl(),
+                List.of(cond("PATH_PREFIX", null, "/order/", 1)), List.of()));
+
+        // "bad" 是 HTTP 合法头值、但不满足追踪号白名单（长度 8..64）：网关必须不采信、自己生成。
+        // 含 CR/LF 的伪造值在 Netty HTTP 解码层就会被拒（到不了过滤器），白名单本身的
+        // 注入字符拦截由 GatewayHeadersTest 覆盖
+        var resp = client.get().uri(baseUrl + "/order/9")
+                .header("X-Trace-Id", "bad")
+                .exchange().block();
+        String traceId = resp.headers().asHttpHeaders().getFirst("X-Gateway-Trace-Id");
+        resp.releaseBody().block();
+
+        assertThat(traceId).isNotBlank().isNotEqualTo("bad");
+        assertThat(traceId).matches("[A-Za-z0-9._-]{8,64}");
+        assertThat(awaitRow(traceId)).isNotNull();
+    }
+
+    @Test
+    void failedRequests_alsoLeaveOneRowWithFinalGatewayStatus_andNeverMixRows() {
+        loadRoutes(route("dead", "http://127.0.0.1:1",
+                List.of(cond("PATH_PREFIX", null, "/dead/", 1)), List.of()));
+
+        // 上游连不上：拿不到上游状态码，但流水照样留痕，状态码=回给调用方的 502
+        var resp = client.get().uri(baseUrl + "/dead/x").exchange().block();
+        assertThat(resp.statusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
+        resp.releaseBody().block();
+
+        // 没匹配上路由也留一行：routeNo=null、状态码=404
+        var resp404 = client.get().uri(baseUrl + "/nowhere").exchange().block();
+        assertThat(resp404.statusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        resp404.releaseBody().block();
+
+        // 并发乱序打两种请求，每笔一行：路径、状态码、路由必须各归各，不能串
+        var threads = new java.util.ArrayList<Thread>();
+        java.util.Random rnd = new java.util.Random(7);
+        for (int i = 0; i < 20; i++) {
+            String path = rnd.nextBoolean() ? "/dead/" + i : "/nowhere/" + i;
+            Thread t = new Thread(() -> {
+                var r = client.get().uri(baseUrl + path).exchange().block();
+                r.releaseBody().block();
+            });
+            threads.add(t);
+        }
+        threads.forEach(Thread::start);
+        threads.forEach(t -> {
+            try {
+                t.join(5000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        org.awaitility.Awaitility.await().untilAsserted(() ->
+                assertThat(recordedEntries).hasSizeGreaterThanOrEqualTo(22));
+        for (com.apigw.domain.accesslog.AccessLogEntry e : recordedEntries) {
+            if (e.path().startsWith("/dead")) {
+                assertThat(e.statusCode()).isEqualTo(502);
+                assertThat(e.routeNo()).isEqualTo("dead");
+            } else if (e.path().startsWith("/nowhere")) {
+                assertThat(e.statusCode()).isEqualTo(404);
+                assertThat(e.routeNo()).isNull();
+            }
+        }
+    }
+
+    private com.apigw.domain.accesslog.AccessLogEntry awaitRow(String requestId) {
+        org.awaitility.Awaitility.await().untilAsserted(() ->
+                assertThat(recordedEntries).anyMatch(e -> e.requestId().equals(requestId)));
+        return recordedEntries.stream()
+                .filter(e -> e.requestId().equals(requestId))
+                .findFirst().orElseThrow();
     }
 }

@@ -1,0 +1,54 @@
+package com.apigw.common.web;
+
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+/**
+ * 网关注入/识别的请求头约定，全项目统一，别散落字面量。
+ *
+ * - {@code X-Trace-Id}（**入站**）：调用方带来的追踪号。带了且格式合法就沿用，
+ *   跨服务排查能直接串起来；没带/非法由网关生成一个 32 位十六进制 UUID 串。
+ *   同一个号还会经响应头 {@code X-Gateway-Trace-Id} 回给调用方。
+ * - {@code X-App-No}（**入站**）：调进来的应用编号。带了且格式合法就入账，认不出来留空，
+ *   绝不能把伪造垃圾写进流水。
+ *
+ * 两个入站头都做白名单校验，原因有二：一是这些值要落库、要进日志，不能放任任意长串/换行注入；
+ * 二是追踪号会回写到响应头，非法字符可能变成响应拆分载体。
+ */
+public final class GatewayHeaders {
+
+    public static final String TRACE_ID_HEADER = "X-Trace-Id";
+    public static final String APP_NO_HEADER = "X-App-No";
+
+    /** 追踪号：字母数字与 . _ -，长度 8..64（覆盖常见 trace/span 号与 UUID）。 */
+    private static final Pattern TRACE_ID_PATTERN = Pattern.compile("[A-Za-z0-9._-]{8,64}");
+
+    /** 应用编号：字母数字与 . _ -，长度 1..64（与路由编号一套字符集）。 */
+    private static final Pattern APP_NO_PATTERN = Pattern.compile("[A-Za-z0-9._-]{1,64}");
+
+    private GatewayHeaders() {
+    }
+
+    /** 合法才认，否则 null（调用方据此决定是否自己生成）。 */
+    public static String normalizeTraceId(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String t = raw.trim();
+        return TRACE_ID_PATTERN.matcher(t).matches() ? t : null;
+    }
+
+    /** 合法才认，否则 null（流水里 app_no 留空）。 */
+    public static String normalizeAppNo(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String t = raw.trim();
+        return APP_NO_PATTERN.matcher(t).matches() ? t : null;
+    }
+
+    /** 网关自己生成的请求编号：32 位十六进制（去横线的 UUID），与既有响应头口径一致。 */
+    public static String newRequestId() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+}

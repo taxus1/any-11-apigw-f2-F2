@@ -2,6 +2,7 @@ package com.apigw;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
 import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
@@ -14,8 +15,12 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  *
  * 开调度：转发侧路由快照的兜底定时刷新（{@code @EnableScheduling}），
  * 配置即时生效主要靠变更事件，调度是多实例间最终一致的兜底。
+ *
+ * 排除 {@link DataSourceAutoConfiguration}：访问流水落库的数据源只有在
+ * {@code apigw.accesslog.enabled=true} 时才由 AccessLogInfrastructureConfig 显式创建，
+ * 没配库的本地/测试环境不会因缺 spring.datasource.url 而启动失败。
  */
-@SpringBootApplication
+@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
 @ConfigurationPropertiesScan
 @EnableScheduling
 public class ApigwApplication {

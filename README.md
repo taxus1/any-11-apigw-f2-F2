@@ -24,6 +24,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | GET | `/api/gateway/routes/{routeNo}` | 路由详情（含全部子项，按顺序号排好） |
 | GET | `/api/gateway/routes?pageNum=&pageSize=&keyword=` | 分页列表（每条带条件/动作计数） |
 | DELETE | `/api/gateway/routes/{routeNo}?expectVersion=` | 删除路由（整树清掉） |
+| GET | `/api/gateway/access-logs?startTime=&endTime=&routeNo=&statusCode=&pageNum=&pageSize=` | 按条件翻访问流水（时间必填，见「翻流水」） |
 
 所有接口返回统一结构 `{ code, msg, data }`：
 
@@ -140,12 +141,76 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 
 ### 访问审计（查账）
 
-- 专用 logger `access-log`，同一次请求记两段，靠同一个 `traceId` 拼回，不会串到别人：
+审计有两份产物，互为补充：
+
+**1）文件式两段日志**：专用 logger `access-log`，同一次请求记两段，靠同一个 `traceId` 拼回，不会串到别人：
+
   - `phase=IN  traceId=... method=... path=... route=- upstream=-`
   - `phase=OUT traceId=... method=... path=... route=... upstream=... status=... outcome=... elapsed=...ms`
-- 命中路由、上游地址、耗时、最终状态码、结果（FORWARDED/NO_ROUTE/UPSTREAM_*/CONFIG_UNAVAILABLE）都在 OUT 段；没匹配上的请求也记。
-- 写日志走独立守护线程 + 有界队列，反应式链路里只做一次微秒级入队；队列满宁可丢日志并计数告警，也不反压转发。
-- 调用方在每个响应（含错误）上都能拿到 `X-Gateway-Trace-Id`，直接和日志对账。
+
+命中路由、上游地址、耗时、最终状态码、结果（FORWARDED/NO_ROUTE/UPSTREAM_*/CONFIG_UNAVAILABLE）都在 OUT 段；没匹配上的请求也记。
+写日志走独立守护线程 + 有界队列，反应式链路里只做一次微秒级入队；队列满宁可丢日志并计数告警，也不反压转发。
+
+**2）访问流水表（一笔请求一行，`gw_access_log`）**：DDL 见 `src/main/resources/db/gw_access_log.sql`，列含义：
+
+| 列 | 口径 |
+| --- | --- |
+| request_id | 请求编号：调用方带了合法 `X-Trace-Id` 就沿用，没带/非法由网关生成 32 位十六进制串；与响应头 `X-Gateway-Trace-Id` 同一个号，跨服务可串联 |
+| route_no | 命中路由编号；没匹配上为 NULL |
+| app_no | 调进来的应用（`X-App-No`，白名单校验），认不出来为 NULL |
+| client_ip | 来源地址，口径同鉴权/限流，见下「来源地址口径」 |
+| method / path | 请求方法 / 应用内路径 |
+| status_code | **最终回给调用方的状态码**：上游码原样透传；上游失败/超时/没连上时填网关合成的 502/504（配置读不出 503、无路 404），失败请求一样留痕；状态行写出前连接就断、一个码都没产出填 `0`（不允许 NULL） |
+| elapsed_ms | 请求总耗时（毫秒） |
+| occurred_at | 发生时间（请求到达时刻，毫秒精度） |
+
+**来源地址口径（全网关唯一实现 `ClientIpResolver`，鉴权/限流/流水共用，不许另写）**：
+依次取 `X-Forwarded-For` 最左一个合法地址 → `X-Real-IP` → 传输层 `remoteAddress`；
+头里的值必须逐段是合法 IPv4/IPv6 字面量才采纳（不做 DNS、不收主机名），伪造值整级跳过往后退。
+
+**并发不串请求**：请求一进来就为这笔请求建一个自己的流水持有者（请求栈上的局部对象，进来段定死编号/应用/来源/方法/路径/发生时刻），
+响应收口时在**同一份对象上**补齐路由/状态码/耗时，凑成完整一行异步入库——不用共享 Map 按 traceId 凑，
+A 的路径绝不可能配到 B 的状态码。
+
+**异步攒批落库（`AsyncBatchingAccessLogSink`，不拖慢转发）**：
+
+- 请求线程只做一次**非阻塞**有界队列入队；攒批、批量写全在独立守护线程 `access-log-db-writer`；
+- 攒批三边界：凑满 `apigw.accesslog.batch-size`（默认 500）立刻落；没满最多等 `flush-interval`（默认 2s）必落；
+  正常退出（SmartLifecycle，Web 容器先停）把队列里剩余记录按批 drain 完，等待封顶 `shutdown-await`（默认 10s），超时不再等、进程退得掉；
+- 队列满（默认 2 万）直接丢这一条并计数告警（每 1000 条打一次 warn），**绝不反压转发**；
+- 每批 `addBatch/executeBatch` 显式包在**一个事务**里，整批提交或整批回滚，不存在「半条记录」；
+  写库失败/库抖动只 warn + 计数，异常不出写线程、也不碰转发主职责；写线程遇意外异常不死亡。
+
+开关与参数（`apigw.accesslog.*`）：默认**关闭**（无库也能本地起网关），生产置 `ACCESSLOG_ENABLED=true`
+并配 `ACCESSLOG_DB_URL/USER/PASSWORD` 即生效；关闭时注入空实现，转发链路零差别。
+
+### 翻流水
+
+`GET /api/gateway/access-logs`，同样返回统一 `Result`，分页结构与路由列表一致：
+
+```
+/api/gateway/access-logs?startTime=2026-09-26T10:00:00Z&endTime=2026-09-26T11:00:00Z
+                        &routeNo=order-route&statusCode=502&pageNum=1&pageSize=20
+```
+
+- `startTime`（含）/`endTime`（不含）必填，ISO-8601：带 `Z`/偏移按带的解释，不带偏移按 UTC；
+- `routeNo`、`statusCode` 可选，条件彼此 AND，可任意组合；
+- `pageNum` 从 1 开始，`pageSize` 默认 20、**上限 200**；
+- 返回 `content / total / pageNum / pageSize / totalPages`，`total` 与当前页在**同一只读事务**里取，严格对得上；
+- 护栏：时间跨度上限 7 天、翻页深度上限 10 万行（要更早数据请缩小时间窗，深翻页不真跑大 OFFSET），
+  JDBC 阻塞调用统一切到 `boundedElastic`，不占 Netty 事件循环。
+
+**索引（随 DDL 建好）及为什么**：
+
+- `PRIMARY KEY(id)`：自增主键，写入顺序追加，InnoDB 聚簇；
+- `idx_occurred_at(occurred_at, id)`：最常用的按时间段翻页走范围索引；`id` 收尾让 `ORDER BY occurred_at, id`
+  与索引顺序一致，同一毫秒内分页不重不漏、也不用 filesort；
+- `idx_route_time(route_no, occurred_at)`：等值列在前（路由编号等值）、范围列在后（时间范围），组合筛选直接命中；
+- `idx_status_time(status_code, occurred_at)`：同理支撑「某时段 5xx/502/504」这类定障排查。
+
+流水只追加不改写，查询模式固定是「时间窗 + 可选等值」三种，三个索引一一对应、没有多余索引拖累批量写入。
+
+调用方在每个响应（含错误）上都能拿到 `X-Gateway-Trace-Id`，直接和流水的 request_id 对账。
 
 ## 配置怎么存
 
@@ -183,6 +248,10 @@ mvn test
 - `RouteCatalogTest`：快照缓存、变更事件即时生效、Redis 故障沿用旧快照、并发冷加载不打雷群。
 - `GatewayProxyFilterTest`：真实 Netty 服务端 + 真实 WebClient 上游 + JDK HTTP 上游的端到端（无 Redis），覆盖方法/路径/查询/请求体转发、请求与响应头增删改、404/502/504 三态、报文绑定头不照抄、热刷新、traceId。
 - `AccessLogRecorderTest`：进/出两段 traceId 串联、不串请求、异步不阻塞。
+- `ClientIpResolverTest` / `GatewayHeadersTest`：来源地址取值顺序与合法 IP 校验（非法头逐级回退）、追踪号/应用编号白名单。
+- `AsyncBatchingAccessLogSinkTest`：攒满即落、窗口超时落、关停 drain 不丢、关停等待封顶、队列满不阻塞不抛异常、写失败不杀写线程。
+- `JdbcAccessLogRepositoryTest`：H2 真实 SQL——整批事务原子性（失败一条不留）、组合筛选、分页数字与稳定排序、毫秒精度。
+- `AccessLogQueryServiceTest` / `AccessLogControllerWebTest`：护栏（时间窗/跨度/深翻页/每页封顶）、分页口径、时间串解析、统一返回。
 - `GatewayProxyIT`：真实容器 + 真实 Redis + 真实上游，建完路由立刻能转发、删完立刻失效；探不到 Redis 时自动跳过。
 
 ## 已知边界（留给后续题目）
