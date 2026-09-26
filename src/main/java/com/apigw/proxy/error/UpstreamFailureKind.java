@@ -12,18 +12,29 @@ import java.net.SocketTimeoutException;
 import java.util.concurrent.TimeoutException;
 
 /**
- * 上游故障的分类。只有把故障类型分清楚，才能给调用方「说得清」且彼此区分的答复：
+ * 网关错误的分类。转发故障与接入鉴权各占一组，给调用方「说得清」且彼此区分的答复：
  *
- * - {@link Kind#NO_ROUTE}       网关这边没找到路由，根本没往上游打        → 404
- * - {@link Kind#UPSTREAM_UNAVAILABLE}  上游连不上（拒接、不可达、TLS 失败） → 502
- * - {@link Kind#UPSTREAM_TIMEOUT}      上游半天不吭声（连接/读取超时）      → 504
- * - {@link Kind#CONFIG_UNAVAILABLE}    网关自己的路由配置此刻读不出来（Redis 挂了且无旧快照）→ 503
+ * 接入鉴权（请求根本没资格进转发）：
+ * - {@link #APP_UNAUTHENTICATED} 凭据缺失/编号不存在/密钥不对/密钥过期 → 401
+ * - {@link #APP_FORBIDDEN}      凭据有效但应用已停用，或来源地址不在名单 → 403
+ * - {@link #APP_CONFIG_UNAVAILABLE} 鉴权配置此刻读不出来（库故障且无旧快照，fail-closed）→ 503
+ *
+ * - {@link #NO_ROUTE}       网关这边没找到路由，根本没往上游打        → 404
+ * - {@link #UPSTREAM_UNAVAILABLE}  上游连不上（拒接、不可达、TLS 失败） → 502
+ * - {@link #UPSTREAM_TIMEOUT}      上游半天不吭声（连接/读取超时）      → 504
+ * - {@link #CONFIG_UNAVAILABLE}    网关自己的路由配置此刻读不出来（Redis 挂了且无旧快照）→ 503
  *
  * 502 和 504 故意分开：连不上是「上游没在/地址错」，超时是「上游在但太慢/卡死」，
  * 前端和值班同学看到的处置动作完全不同，绝不能回成同一种错误。
  */
 public enum UpstreamFailureKind {
 
+    APP_UNAUTHENTICATED(HttpStatus.UNAUTHORIZED, "APP_UNAUTHENTICATED",
+            "应用凭据缺失或无效：请使用网关签发的应用编号与密钥（X-App-No / X-App-Secret）"),
+    APP_FORBIDDEN(HttpStatus.FORBIDDEN, "APP_FORBIDDEN",
+            "应用已停用或来源地址不在来路名单内，网关拒绝本次调用"),
+    APP_CONFIG_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "APP_CONFIG_UNAVAILABLE",
+            "接入鉴权配置暂时不可用，请稍后重试"),
     NO_ROUTE(HttpStatus.NOT_FOUND, "NO_ROUTE",
             "网关未匹配到路由：该请求没有对应的转发规则"),
     UPSTREAM_UNAVAILABLE(HttpStatus.BAD_GATEWAY, "UPSTREAM_UNAVAILABLE",

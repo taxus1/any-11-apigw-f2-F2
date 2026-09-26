@@ -13,11 +13,12 @@ spring:
       discovery:
         locator:
           enabled: false
-  # 仅 apigw.accesslog.enabled=true 时才会去连库；关闭时下面这些完全不被读取
+  # accesslog / app-auth 任一开启时才会连库（两套功能共用同一个数据源）；都关闭时下面这些不被读取。
+  # 环境变量沿用 ACCESSLOG_DB_*（向后兼容），新增同义的 GATEWAY_DB_*。
   datasource:
-    url: ${ACCESSLOG_DB_URL:jdbc:mysql://localhost:3306/apigw?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&rewriteBatchedStatements=true}
-    username: ${ACCESSLOG_DB_USER:root}
-    password: ${ACCESSLOG_DB_PASSWORD:}
+    url: ${GATEWAY_DB_URL:${ACCESSLOG_DB_URL:jdbc:mysql://localhost:3306/apigw?useSSL=false&serverTimezone=UTC&characterEncoding=utf8&rewriteBatchedStatements=true}}
+    username: ${GATEWAY_DB_USER:${ACCESSLOG_DB_USER:root}}
+    password: ${GATEWAY_DB_PASSWORD:${ACCESSLOG_DB_PASSWORD:}}
     driver-class-name: com.mysql.cj.jdbc.Driver
 
 server:
@@ -41,6 +42,13 @@ apigw:
     flush-interval: 2s
     queue-capacity: 20000
     shutdown-await: 10s
+  # 第三方接入鉴权。本地默认关闭（无库也能起网关）；生产置 APP_AUTH_ENABLED=true。
+  # 开启后转发流量必须带 X-App-No + X-App-Secret 且过停用/有效期/来路名单校验。
+  # 凭据/名单在内存缓存：管理侧改动经事件即时生效，多实例靠 10s 定时兜底收敛。
+  app-auth:
+    enabled: ${APP_AUTH_ENABLED:false}
+    refresh-interval: 10s
+    refresh-interval-ms: 10000
 
 logging:
   level:

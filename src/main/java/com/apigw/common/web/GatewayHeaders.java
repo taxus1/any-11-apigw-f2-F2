@@ -10,7 +10,9 @@ import java.util.regex.Pattern;
  *   跨服务排查能直接串起来；没带/非法由网关生成一个 32 位十六进制 UUID 串。
  *   同一个号还会经响应头 {@code X-Gateway-Trace-Id} 回给调用方。
  * - {@code X-App-No}（**入站**）：调进来的应用编号。带了且格式合法就入账，认不出来留空，
- *   绝不能把伪造垃圾写进流水。
+ *   绝不能把伪造垃圾写进流水。开启接入鉴权时，它和 {@code X-App-Secret} 合起来是调用方的凭据。
+ * - {@code X-App-Secret}（**入站**）：调用方持有的密钥明文，仅用于当次校验，
+ *   不记录、不回显、不落库（库里只有它的不可逆散列）。
  *
  * 两个入站头都做白名单校验，原因有二：一是这些值要落库、要进日志，不能放任任意长串/换行注入；
  * 二是追踪号会回写到响应头，非法字符可能变成响应拆分载体。
@@ -19,6 +21,8 @@ public final class GatewayHeaders {
 
     public static final String TRACE_ID_HEADER = "X-Trace-Id";
     public static final String APP_NO_HEADER = "X-App-No";
+    /** 应用密钥头：只用于网关当次比对散列，绝不写日志/落库。 */
+    public static final String APP_SECRET_HEADER = "X-App-Secret";
 
     /** 追踪号：字母数字与 . _ -，长度 8..64（覆盖常见 trace/span 号与 UUID）。 */
     private static final Pattern TRACE_ID_PATTERN = Pattern.compile("[A-Za-z0-9._-]{8,64}");

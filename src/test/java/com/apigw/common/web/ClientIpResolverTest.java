@@ -102,4 +102,40 @@ class ClientIpResolverTest {
         String ip = ClientIpResolver.resolve(exchange.getRequest());
         assertThat(ip).isEqualTo("192.0.2.10");
     }
+
+    @Test
+    void canonicalize_ipv4_stripsLeadingZerosAndKeepsExactAddress() {
+        assertThat(ClientIpResolver.canonicalize("192.168.1.1")).isEqualTo("192.168.1.1");
+        assertThat(ClientIpResolver.canonicalize("010.000.001.001")).isEqualTo("10.0.1.1");
+        // 严格精确：规范化后 192.168.1.1 与 192.168.1.10 必然不同，不产生任何前缀式匹配
+        assertThat(ClientIpResolver.canonicalize("192.168.1.1"))
+                .isNotEqualTo(ClientIpResolver.canonicalize("192.168.1.10"));
+    }
+
+    @Test
+    void canonicalize_ipv6_sameAddressDifferentSpellingCollapses() {
+        // 大小写、:: 压缩、全写是同一个地址，名单比对不能因为写法不同而误拒
+        assertThat(ClientIpResolver.canonicalize("2001:DB8::1"))
+                .isEqualTo(ClientIpResolver.canonicalize("2001:db8:0:0:0:0:0:1"))
+                .isEqualTo("2001:0db8:0000:0000:0000:0000:0000:0001");
+        assertThat(ClientIpResolver.canonicalize("::1"))
+                .isEqualTo(ClientIpResolver.canonicalize("0:0:0:0:0:0:0:1"));
+        // 内嵌 IPv4 与纯十六进制写法等价
+        assertThat(ClientIpResolver.canonicalize("::ffff:192.0.2.1"))
+                .isEqualTo(ClientIpResolver.canonicalize("::ffff:c000:0201"));
+        // zone 不参与身份
+        assertThat(ClientIpResolver.canonicalize("fe80::1%eth0"))
+                .isEqualTo(ClientIpResolver.canonicalize("fe80::1"));
+    }
+
+    @Test
+    void canonicalize_rejectsNonLiterals() {
+        assertThat(ClientIpResolver.canonicalize("order-svc")).isNull();
+        assertThat(ClientIpResolver.canonicalize("localhost")).isNull();
+        assertThat(ClientIpResolver.canonicalize("192.168.1.0/24")).isNull();
+        assertThat(ClientIpResolver.canonicalize("999.1.1.1")).isNull();
+        assertThat(ClientIpResolver.canonicalize("2001:db8:::1")).isNull();
+        assertThat(ClientIpResolver.canonicalize("")).isNull();
+        assertThat(ClientIpResolver.canonicalize(null)).isNull();
+    }
 }
