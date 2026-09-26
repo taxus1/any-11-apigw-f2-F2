@@ -1,0 +1,93 @@
+package com.apigw.proxy.error;
+
+import io.netty.handler.timeout.ReadTimeoutException;
+import org.springframework.http.HttpStatus;
+
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLHandshakeException;
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * 上游故障的分类。只有把故障类型分清楚，才能给调用方「说得清」且彼此区分的答复：
+ *
+ * - {@link Kind#NO_ROUTE}       网关这边没找到路由，根本没往上游打        → 404
+ * - {@link Kind#UPSTREAM_UNAVAILABLE}  上游连不上（拒接、不可达、TLS 失败） → 502
+ * - {@link Kind#UPSTREAM_TIMEOUT}      上游半天不吭声（连接/读取超时）      → 504
+ * - {@link Kind#CONFIG_UNAVAILABLE}    网关自己的路由配置此刻读不出来（Redis 挂了且无旧快照）→ 503
+ *
+ * 502 和 504 故意分开：连不上是「上游没在/地址错」，超时是「上游在但太慢/卡死」，
+ * 前端和值班同学看到的处置动作完全不同，绝不能回成同一种错误。
+ */
+public enum UpstreamFailureKind {
+
+    NO_ROUTE(HttpStatus.NOT_FOUND, "NO_ROUTE",
+            "网关未匹配到路由：该请求没有对应的转发规则"),
+    UPSTREAM_UNAVAILABLE(HttpStatus.BAD_GATEWAY, "UPSTREAM_UNAVAILABLE",
+            "上游服务暂时不可达（连接失败），网关未能完成转发"),
+    UPSTREAM_TIMEOUT(HttpStatus.GATEWAY_TIMEOUT, "UPSTREAM_TIMEOUT",
+            "上游服务响应超时，网关未在规定时间内拿到响应"),
+    CONFIG_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "CONFIG_UNAVAILABLE",
+            "网关路由配置暂时不可用，请稍后重试"),
+    UPSTREAM_PROTOCOL_ERROR(HttpStatus.BAD_GATEWAY, "UPSTREAM_PROTOCOL_ERROR",
+            "上游返回了无法处理的响应，网关未能完成转发");
+
+    private final HttpStatus httpStatus;
+    private final String errorCode;
+    private final String message;
+
+    UpstreamFailureKind(HttpStatus httpStatus, String errorCode, String message) {
+        this.httpStatus = httpStatus;
+        this.errorCode = errorCode;
+        this.message = message;
+    }
+
+    public HttpStatus httpStatus() {
+        return httpStatus;
+    }
+
+    public int statusCode() {
+        return httpStatus.value();
+    }
+
+    /** 机器可读的错误码，回在响应头 X-Gateway-Error 与响应体 error 字段里。 */
+    public String errorCode() {
+        return errorCode;
+    }
+
+    /** 给调用方看的「说得清」的话；不含任何内部堆栈或上游原始错误页。 */
+    public String message() {
+        return message;
+    }
+
+    /**
+     * 把转发过程中抛出的异常归到一类。Reactor Netty/WebClient 会在异常外再包几层
+     * （WebClientRequestException、Exceptions.propagate 等），所以沿 cause 链找。
+     */
+    public static UpstreamFailureKind classify(Throwable error) {
+        java.util.Set<Throwable> seen = new java.util.HashSet<>();
+        for (Throwable t = error; t != null && seen.add(t); t = t.getCause()) {
+            // 超时类放最前：ReadTimeoutException 本身也是 IOException 的子类，必须先判
+            if (t instanceof ReadTimeoutException
+                    || t instanceof TimeoutException
+                    || t instanceof SocketTimeoutException) {
+                return UPSTREAM_TIMEOUT;
+            }
+            if (t instanceof ConnectException
+                    || t instanceof NoRouteToHostException
+                    || t instanceof SSLException
+                    || t instanceof SSLHandshakeException) {
+                return UPSTREAM_UNAVAILABLE;
+            }
+            if (t instanceof IOException) {
+                // 连接被重置、对端断连等其余 IO 故障，统一按上游不可用
+                return UPSTREAM_UNAVAILABLE;
+            }
+        }
+        // 拿不准的故障也不能把原始异常抛给调用方，按 502 兜底
+        return UPSTREAM_PROTOCOL_ERROR;
+    }
+}

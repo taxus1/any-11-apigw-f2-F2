@@ -17,6 +17,20 @@ spring:
 server:
   port: ${SERVER_PORT:8080}
 
+# 转发链路参数：连不上上游（3s 握手不成）→ 502；上游半天不吭声（10s 不回）→ 504。
+# 路由快照事件即时刷新 + 10s 兜底轮询，所以增删改路由不用重启即可生效。
+apigw:
+  proxy:
+    connect-timeout: 3s
+    response-timeout: 10s
+    route-refresh-interval: 10s
+    # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
+    route-refresh-interval-ms: 10000
+
 logging:
   level:
     com.apigw: debug
+  # 访问审计日志单独打，便于查账时直接取「进/出两段、traceId 串联」的记录
+  group:
+    access:
+      - access-log

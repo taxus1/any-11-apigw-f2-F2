@@ -55,7 +55,14 @@ public class RedisRouteDefinitionRepository implements RouteDefinitionRepository
                 .sort(Comparator.comparing(GatewayRoute::getRouteNo))
                 .map(this::toRouteDefinition)
                 .doOnNext(d -> log.debug("装载路由定义 id={} uri={} predicates={} filters={}",
-                        d.getId(), d.getUri(), d.getPredicates().size(), d.getFilters().size()));
+                        d.getId(), d.getUri(), d.getPredicates().size(), d.getFilters().size()))
+                // Redis 一时不可用不能拖垮整个应用启动：转发链路（GatewayProxyWebFilter）有自己的
+                // 路由快照与容错，这里作为只读适配退化为「暂无可装载定义」，等下一次刷新再补
+                .onErrorResume(err -> {
+                    log.warn("从 Redis 装载 SCG 路由定义失败，本次按空路由处理（转发链路仍按其快照服务）：{}",
+                            err.toString());
+                    return Flux.empty();
+                });
     }
 
     @Override

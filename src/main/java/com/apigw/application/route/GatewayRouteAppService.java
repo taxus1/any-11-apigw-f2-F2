@@ -6,6 +6,8 @@ import com.apigw.domain.route.GatewayRule;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
+import com.apigw.proxy.route.RoutesChangedEvent;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -29,9 +31,11 @@ public class GatewayRouteAppService {
     private static final int DEFAULT_PAGE_SIZE = 20;
 
     private final RouteStore routeStore;
+    private final ApplicationEventPublisher eventPublisher;
 
-    public GatewayRouteAppService(RouteStore routeStore) {
+    public GatewayRouteAppService(RouteStore routeStore, ApplicationEventPublisher eventPublisher) {
         this.routeStore = routeStore;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -44,7 +48,8 @@ public class GatewayRouteAppService {
         }
         // 新建不接受客户端自带版本，一律从 0 开始；store.create 里也会再钉一次做双保险
         input.setVersion(0);
-        return routeStore.create(input);
+        return routeStore.create(input)
+                .doOnSuccess(r -> eventPublisher.publishEvent(RoutesChangedEvent.created(r.getRouteNo())));
     }
 
     /**
@@ -56,7 +61,8 @@ public class GatewayRouteAppService {
         // id 不接受客户端指定，store 里沿用现有 id
         input.assignRouteNo(routeNo);
         input.setId(null);
-        return routeStore.update(input);
+        return routeStore.update(input)
+                .doOnSuccess(r -> eventPublisher.publishEvent(RoutesChangedEvent.updated(r.getRouteNo())));
     }
 
     public Mono<GatewayRoute> detail(String routeNo) {
@@ -66,7 +72,8 @@ public class GatewayRouteAppService {
 
     /** 删除：不存在、版本旧了都会拿到明确的失败结果，绝不静默当成功。 */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
-        return routeStore.delete(routeNo, expectVersion);
+        return routeStore.delete(routeNo, expectVersion)
+                .doOnSuccess(v -> eventPublisher.publishEvent(RoutesChangedEvent.deleted(routeNo)));
     }
 
     /**

@@ -39,7 +39,8 @@ class GatewayRouteControllerWebTest {
     @BeforeEach
     void setUp() {
         store = mock(RouteStore.class);
-        var appService = new GatewayRouteAppService(store);
+        var events = mock(org.springframework.context.ApplicationEventPublisher.class);
+        var appService = new GatewayRouteAppService(store, events);
         web = WebTestClient.bindToController(new GatewayRouteController(appService))
                 .controllerAdvice(new GlobalExceptionHandler())
                 .build();
@@ -166,8 +167,9 @@ class GatewayRouteControllerWebTest {
     void update_withoutVersion_rejectedWithClearMessage() {
         // 真实 RouteStore 的版本检查发生在碰 Redis 之前，null redis 也能验证到这条
         var realStore = new RouteStore(null, new ObjectMapper());
+        var events = mock(org.springframework.context.ApplicationEventPublisher.class);
         var client = WebTestClient.bindToController(
-                        new GatewayRouteController(new GatewayRouteAppService(realStore)))
+                        new GatewayRouteController(new GatewayRouteAppService(realStore, events)))
                 .controllerAdvice(new GlobalExceptionHandler())
                 .build();
 
