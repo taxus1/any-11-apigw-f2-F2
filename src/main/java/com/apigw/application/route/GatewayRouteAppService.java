@@ -108,9 +108,9 @@ public class GatewayRouteAppService {
 
     /** 把一份外部输入整理成聚合（聚合的全部校验在这里同步完成）。 */
     public GatewayRoute assemble(String routeNo, String name, String upstream, Integer enabled,
-                                 String remark, Integer version,
+                                 Integer requireLogin, String remark, Integer version,
                                  List<GatewayRule> conditions, List<GatewayRule> actions) {
-        GatewayRoute route = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
+        GatewayRoute route = GatewayRoute.create(routeNo, name, upstream, enabled, requireLogin, remark);
         // version 原样带入：修改时必须等于当前版本；为空会在 store 被拒
         route.setVersion(version);
         route.replaceRules(conditions, actions);

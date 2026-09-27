@@ -38,7 +38,10 @@ public class UpstreamForwarder {
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
             "trailer", "transfer-encoding", "upgrade", "http2-settings",
             // 内容长度/传输编码与具体报文绑死，交给客户端/框架按实际报文重算
-            "content-length", "host"));
+            "content-length", "host",
+            // 入站登录令牌只用于网关当次验签，验完即弃；身份由 X-Auth-User/X-Auth-Tenant
+            // 透传，原始令牌一律不往上游送（UserTokenAuthWebFilter 已剥一道，这里再钉死，双保险）
+            "authorization"));
 
     private final WebClient webClient;
 

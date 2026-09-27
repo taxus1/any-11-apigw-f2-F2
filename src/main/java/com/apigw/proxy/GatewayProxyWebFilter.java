@@ -132,7 +132,12 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
 
         return routeCatalog.routes()
                 .flatMap(routes -> {
-                    GatewayRoute route = routeMatcher.match(routes, exchange.getRequest());
+                    // 用户登录鉴权过滤器已在同一笔请求上匹配过时直接复用，不再匹配第二次；
+                    // 没配（功能关闭）或未命中时回到自己的匹配
+                    GatewayRoute preMatched =
+                            (GatewayRoute) exchange.getAttribute(RouteCatalog.MATCHED_ROUTE_ATTRIBUTE);
+                    GatewayRoute route = preMatched != null
+                            ? preMatched : routeMatcher.match(routes, exchange.getRequest());
                     if (route == null) {
                         outcome.set(new Outcome(null, null, "NO_ROUTE"));
                         return GatewayErrors.write(exchange, objectMapper,

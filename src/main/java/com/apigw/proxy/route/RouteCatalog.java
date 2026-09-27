@@ -32,6 +32,13 @@ import java.util.List;
 @Component
 public class RouteCatalog {
 
+    /**
+     * 已匹配路由在 exchange 上的属性键。登录鉴权过滤器先于转发过滤器完成一次匹配，
+     * 把结果存这里，转发过滤器直接复用——同笔请求不匹配第二次，也保证
+     * 「要不要登录」和「转发给谁」是同一份判定。仅在用户登录鉴权开启时由它写入。
+     */
+    public static final String MATCHED_ROUTE_ATTRIBUTE = RouteCatalog.class.getName() + ".matchedRoute";
+
     private final RouteStore routeStore;
     private final Duration ttl;
 

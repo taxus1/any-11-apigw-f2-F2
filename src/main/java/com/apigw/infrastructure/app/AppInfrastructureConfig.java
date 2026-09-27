@@ -29,11 +29,8 @@ import java.time.Clock;
 @ConditionalOnProperty(prefix = "apigw.app-auth", name = "enabled", havingValue = "true")
 public class AppInfrastructureConfig {
 
-    /** 全系统统一时钟：生产走系统 UTC 时钟，测试可换固定时钟验证密钥过期边界。 */
-    @Bean
-    Clock gatewayClock() {
-        return Clock.systemUTC();
-    }
+    // 全系统统一 Clock 由常驻的 com.apigw.common.time.GatewayTimeConfig 提供，
+    // 避免与用户登录鉴权模块各自定义同名 bean 冲突。
 
     @Bean
     AppCredentialRepository appCredentialRepository(JdbcTemplate gatewayJdbcTemplate,

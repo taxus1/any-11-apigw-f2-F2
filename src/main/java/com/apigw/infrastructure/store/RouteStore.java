@@ -212,6 +212,8 @@ public class RouteStore {
         public String name;
         public String upstream;
         public Integer enabled;
+        /** 是否需要登录：0 开放 / 1 必须登录；旧数据没这字段时 toDomain 按 0（开放）处理。 */
+        public Integer requireLogin;
         public String remark;
         public Integer version;
         public List<RuleDto> conditions = new ArrayList<>();
@@ -224,6 +226,7 @@ public class RouteStore {
             d.name = r.getName();
             d.upstream = r.getUpstream();
             d.enabled = r.getEnabled();
+            d.requireLogin = r.getRequireLogin();
             d.remark = r.getRemark();
             d.version = r.getVersion();
             d.conditions = r.getConditions().stream().map(RuleDto::from).toList();
@@ -232,7 +235,7 @@ public class RouteStore {
         }
 
         GatewayRoute toDomain() {
-            GatewayRoute r = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
+            GatewayRoute r = GatewayRoute.create(routeNo, name, upstream, enabled, requireLogin, remark);
             r.setId(id);
             r.setVersion(version == null ? 0 : version);
             r.replaceRules(

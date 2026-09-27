@@ -2,11 +2,12 @@
 
 Spring Cloud Gateway（WebFlux 响应式）+ Redis 动态路由配置。JDK 17 / Spring Boot 3.2.5 / Spring Cloud 2023.0.1。
 
-同一个应用里跑三件事：
+同一个应用里跑四件事：
 
 1. **转发链路**：请求进来 → 按配置的匹配条件找到路由 → 按配置的转发动作处理请求头 → 打到上游 → 响应回来处理响应头 → 交还调用方。配置在 Redis，改完经事件即时生效，不用重启（另有定时兜底刷新保证多实例最终一致）。
-2. **路由管理接口**：`/api/gateway/routes`，维护路由及其匹配条件、转发动作。
+2. **路由管理接口**：`/api/gateway/routes`，维护路由及其匹配条件、转发动作（含每条路由要不要登录的 `requireLogin` 标记）。
 3. **第三方接入管理 + 鉴权**：`/api/gateway/apps`，维护第三方应用凭据与来路名单；开启后转发流量必须凭「应用编号 + 密钥」通过鉴权才放行。
+4. **用户登录鉴权 + 身份透传**：路由级开关 `requireLogin`，内部路由凭网关签发的 Bearer JWT 放行；验过把用户/租户经 `X-Auth-User` / `X-Auth-Tenant` 透传上游、每笔请求盖上游可验的 `X-Gateway-Stamp`，原始令牌不上递、伪造身份头先剥再写。
 
 ## 起环境
 
@@ -42,6 +43,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
   "name": "订单服务路由",
   "upstream": "http://order-svc:8080",
   "enabled": 1,
+  "requireLogin": 0,
   "remark": "给前端下单用",
   "version": 0,
   "conditions": [
@@ -60,6 +62,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 ```
 
 - 路由编号：业务唯一，建后**不可改**（PUT 的 body 里编号与路径不一致会被拦）；停用的路由也占号，只有删除才释放编号。
+- `requireLogin`：这条路由要不要登录，只认 `0`（开放，默认）/ `1`（必须登录）。开放路由谁都能打、没带令牌也放行；必须登录的路由必须带一张网关签发的有效令牌（详见「用户登录鉴权与身份透传」）。**开启用户登录鉴权功能后该标记才生效**，功能关闭时不做任何令牌校验。
 - 匹配条件只认 `PATH_PREFIX` / `METHOD` / `HEADER` / `QUERY`；路径、方法两类不用填 `name`。
 - 转发动作只认 `REQ_ADD_HEADER` / `REQ_REMOVE_HEADER` / `RESP_ADD_HEADER` / `RESP_REMOVE_HEADER`；删头不用填 `value`。
 - 顺序号每组各自从 1 开始，必须**连续、不重**。撞号会报「匹配条件第 a 条与第 b 条的顺序号撞了，都是 n」；跳号会报缺了第几。
@@ -92,6 +95,8 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 ```
 请求进来
  → 生成 traceId，写访问日志第 1 段（phase=IN）
+ → （开启用户登录鉴权时）按 requireLogin 分流：内部路由验令牌，开放路由尽力识别身份；
+    剥光伪造身份头、写 X-Auth-User/X-Auth-Tenant、盖 X-Gateway-Stamp、剥原始 Authorization
  → 在内存路由快照上匹配唯一路由（匹配不到 → 404 NO_ROUTE）
  → 清洗逐跳/报文绑定头 + X-Forwarded-* + 按顺序号执行请求类动作
  → 发到上游（请求体流式透传，不缓冲）
@@ -129,6 +134,8 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | 上游连不上（拒接/不可达/TLS 失败） | 502 | `UPSTREAM_UNAVAILABLE` | 上游没在或地址错 |
 | 上游半天不吭声（连接/读取超时） | 504 | `UPSTREAM_TIMEOUT` | 上游在但太慢/卡死，调用方不用干等 |
 | 路由配置此刻读不出来（Redis 故障且无旧快照） | 503 | `CONFIG_UNAVAILABLE` | 网关侧配置故障 |
+| 必须登录路由：令牌缺失/签名错/过期/声明不全 | 401 | `TOKEN_UNAUTHENTICATED` | 用户登录鉴权（详见专章），文案不区分原因 |
+| 登录鉴权时路由配置读不出来 | 503 | `TOKEN_CONFIG_UNAVAILABLE` | 无法判断要不要登录，fail-closed |
 
 - 上游自己的 4xx/5xx 是业务结果，状态码与响应体**原样透传**，网关不改写。
 - 错误体只有网关的固定文案 + traceId，绝不外抛内部堆栈或上游原始错误页。
@@ -293,6 +300,88 @@ X-Forwarded-For 最左一个合法地址  →  X-Real-IP  →  传输层 remoteA
 - 库一时抖动：有旧快照就沿用旧快照继续服务并告警；**从未加载成功过时 fail-closed 回 503**，绝不裸放行。
 - 密钥有效期按每笔请求的当前时刻判定，到点即拒，不需要额外操作。
 
+## 用户登录鉴权与身份透传
+
+网关在「调用方 → 上游」这一段上认用户身份：令牌由网关（或共享密钥的签发侧）签发，调用方带在 `Authorization: Bearer <jwt>` 里；网关验过之后，把「用户是谁、属于哪个租户」用固定头透传给上游，上游不必再自己解令牌。功能默认关闭，生产置 `USER_AUTH_ENABLED=true`。
+
+### 开关（跟路由配置走）
+
+- 全局开关：`apigw.user-auth.enabled`（环境变量 `USER_AUTH_ENABLED`），关闭时整套不装配，转发链路与没做这功能时一致。
+- 路由开关：每条路由配置上的 `requireLogin`，只认：
+  - `0`（默认）**开放路由**：谁都能打，没带令牌也照常放行；
+  - `1` **必须登录路由**：必须带一张验签通过、没过期、信息齐全的令牌，否则 401。
+- 两类路由混用同一条转发链路，是否校验由「这笔请求命中的那条路由」决定，开放路由的错误请求/无令牌请求绝不会走进内部路由的鉴权分支被拦。
+- 标记跟着路由 JSON 一起存 Redis、一起热刷新；历史路由 JSON 里没这个字段时按 `0`（开放）解释。
+
+### 令牌怎么验（不是拆开看字段，是真验签）
+
+令牌是紧凑序列化的 JWT（`base64url(header).base64url(payload).base64url(signature)`），`header` 固定 `{"alg":"HS256","typ":"JWT"}`，`payload` 至少含 `sub`（用户标识）、`tenant`（租户标识）、`exp`（过期 epoch 秒）、`iat`（签发 epoch 秒）。网关每笔请求按顺序验：
+
+1. **形状**：恰好三段、每段合法 base64url；
+2. **算法钉死**：解出的 header 必须 `alg=HS256`、`typ=JWT`。`alg:none`、换算法名都拒——没有「算法协商」，杜绝改头部冒充无签名、公钥当 HMAC 密钥等经典伪造；
+3. **真验签**：用配置的密钥对前两段重算 HMAC-SHA256，与第三段常量时间逐字节比较（`MessageDigest.isEqual`），差一个 bit 都拒。只把令牌拆开看字段、伪造签名、塞「永不过期」之类私字段，统统过不了；
+4. **过期卡死**：`exp` 必须是数值，且判定为 `now >= exp` 即过期——**正好压在过期那一刻也算过期**，没有任何宽限钟（leeway）；
+5. **声明齐全**：`sub` / `tenant` 必须是非空字符串；解出来的值还要过一次身份白名单（`[A-Za-z0-9._@=-]{1,256}`，挡住 CR/LF、空白、非 ASCII 的头注入值）。
+
+任何一样不过（含压根没带、不是 Bearer 方案），内部路由统一回 **401 `TOKEN_UNAUTHENTICATED`**，对外文案不区分「没带/签名错/过期/缺声明」，内部原因只写服务端 debug 日志。
+
+### 密钥只走配置，不硬编码
+
+- 令牌密钥 `apigw.user-auth.token-secret`（环境变量 `USER_AUTH_TOKEN_SECRET`）；
+- 网关戳密钥 `apigw.user-auth.stamp-secret`（`USER_AUTH_STAMP_SECRET`），留空时复用令牌密钥；生产建议分开——戳密钥要分发到各上游验真，令牌密钥不发；
+- **没有内置默认密钥**：开关开了却没配、或密钥短于 32 字节，应用直接启动失败（fail-fast），不会退回一个写死在代码里的密钥。
+
+### 身份透传（固定头，上游不用再解令牌）
+
+验过之后，网关在发往上游的请求上写：
+
+| 头 | 含义 |
+| --- | --- |
+| `X-Auth-User` | 用户标识（令牌里的 `sub`） |
+| `X-Auth-Tenant` | 租户标识（令牌里的 `tenant`） |
+| `X-Gateway-Stamp` | 网关盖的「这笔请求确实过了网关」的戳（见下） |
+
+- **原始令牌不上递**：`Authorization` 头在网关验完即剥（鉴权过滤器剥一道、转发器头清洗里再钉死一道，双保险），上游只认身份头。
+- 开放路由的匿名请求没有前两个头（上游据此区分匿名/登录），但一样盖戳（戳里身份字段为空串）。
+
+### 防伪造（硬安全线：谁定的算数）
+
+`X-Auth-User` / `X-Auth-Tenant` / `X-Gateway-Stamp` 是「网关说了算」的头。请求进来时，**无论命中哪条路由**，网关先把调用方自带的同名头一律剥光，再只按自己的验签/盖章结果写回。调用方在请求里塞再多假的身份头、假戳，到上游都会被清掉——上游看到的这三个头只有网关一个来源。
+
+### 网关戳（上游可验真，伪造不出来）
+
+`X-Gateway-Stamp` 让上游确认「这笔请求确实经过网关、且头没被中途改过」。头值：
+
+```
+v1.<unixEpochSeconds>.<base64url(HMAC-SHA256(canonicalString, stamp-secret))>
+```
+
+`canonicalString` 各字段以换行分隔，依次为：`v1`、时间戳、大写方法、应用内路径（原样）、URLEncoder 后的原始 query（无则空串）、`X-Gateway-Trace-Id`、用户标识（匿名空串）、租户标识（匿名空串）。上游用共享的戳密钥按同一规则重算一遍即可验真；调用方拿不到密钥，且戳与「方法+路径+query+trace+身份」绑定，截到一枚真戳也挪不到别的请求上。
+
+### 跨域（前端读得到这些头）
+
+CORS 过滤器排在鉴权之前：预检（OPTIONS）不带令牌也能在鉴权之前直接答复，不会被内部路由的 401 挡掉；正式响应回 `Access-Control-Expose-Headers`，显式放行 `X-Auth-User` / `X-Auth-Tenant` / `X-Gateway-Stamp`（外加 `X-Gateway-Trace-Id` / `X-Gateway-Error`）——浏览器 JS 默认只能读简单响应头，不在这里放行，前端读不到。允许来源由 `apigw.user-auth.cors-allowed-origins`（`USER_AUTH_CORS_ORIGINS`，逗号分隔）配置，默认 `*`（此时不带凭证），生产建议配成明确站点清单。
+
+### 开放路由遇到坏令牌：放行、按匿名处理
+
+口径统一为**放行但不赋予身份**。开放路由的契约是「令牌不是入场券」：浏览器/客户端常对同一域名的所有请求自动带上过期或无效的 Authorization（旧登录态、爬虫、探测请求），若因此回 401，公共页面会被一张过期令牌打成登录失效，和「没带令牌照常放行」自相矛盾。所以开放路由尽力识别身份——令牌有效就按登录用户透传，令牌缺失/损坏/过期（含「签名有效但身份声明写不进头」）都与「没带」同等对待，照常放行且不写身份头。坏令牌换不到任何身份，放行它没有额外权限代价。内部路由不适用这条：任何一点不过就是 401。
+
+### 鉴权结果
+
+| 场景 | HTTP | `X-Gateway-Error` |
+| --- | --- | --- |
+| 必须登录路由：没带令牌、不是 Bearer、签名错、过期（含正好到点）、声明不全/不合法 | 401 | `TOKEN_UNAUTHENTICATED` |
+| 路由配置此刻读不出来（Redis 故障且无旧快照），无法判断要不要登录 | 503 | `TOKEN_CONFIG_UNAVAILABLE` |
+
+### 过滤器顺序
+
+```
+AppAuthWebFilter        HIGHEST+5   第三方接入凭据（可选，先认「哪个应用」）
+OrderedCorsWebFilter    HIGHEST+6   预检在此直接答复，不透到鉴权
+UserTokenAuthWebFilter  HIGHEST+8   路由分流：要不要登录、验签、剥/写身份头、盖戳
+GatewayProxyWebFilter   HIGHEST+10  复用已匹配路由，转发上游（再剥一道 Authorization）
+```
+
 ## 配置怎么存
 
 ```
@@ -320,7 +409,7 @@ docker compose up -d     # 提供真实 Redis
 mvn test
 ```
 
-- `GatewayRouteTest`：聚合不变量（编号不可改、上游地址、顺序号撞/跳并报位置、类型白名单、必填项），无需 Redis。
+- `GatewayRouteTest`：聚合不变量（编号不可改、上游地址、顺序号撞/跳并报位置、类型白名单、必填项、`requireLogin` 只认 0/1），无需 Redis。
 - `GatewayRouteControllerWebTest`：HTTP 切片（真实 Controller + AppService + 聚合，mock 掉 Redis），覆盖统一返回、报错文案、分页数字与子项计数。
 - `RouteStoreTest` / `GatewayRouteControllerIT`：连真实 Redis，覆盖 HSETNX 原子占号、并发建同号、乐观锁 409、整树替换与级联删除。本机探测不到 `localhost:6379` 时自动跳过（可用 `-Dredis.host/-Dredis.port` 指向别处）。
 - `PathPrefixMatcherTest` / `RouteMatcherTest`：路径前缀边界（尾斜杠/段边界/大小写）、四类条件 AND、多命中稳定定序。
@@ -340,6 +429,12 @@ mvn test
 - `ClientAppControllerWebTest`：统一返回、创建响应一次性密钥且无散列字段、404/错误收口、来路增删。
 - `AppAuthWebFilterTest`：真实 Netty 端到端——缺/错凭据与过期 401、停用/来路 403、XFF 多跳取值、`.1` 不放 `.10`、IPv6 写法归并、停用与名单改完对下一笔请求即时生效。
 - `AppAuthEnabledSmokeTest` / `AppAuthDisabledSmokeTest`：开关开时整组 bean 装配且快照建立，关时一个都不装、上下文照常起。
+- `JwtUserTokenTest`：真验签——假签名、他密钥签名、改载荷、`alg:none`/换算法/错 typ、坏 base64、缺 `exp`/`sub`/`tenant`、塞「永不过期」私字段全部识破；过期边界 `now == exp` 按过期、前一秒有效。
+- `GatewayStampSignerTest`：用上游侧独立实现验戳，匿名/登录戳都验得过，换方法/路径/身份/trace/密钥均验不过。
+- `UserAuthPropertiesTest` / `UserAuthMissingSecretFailFastTest`：默认关闭；开启却没配/密钥过短 fail-fast，不退回内置默认密钥；戳密钥缺省复用令牌密钥。
+- `UserTokenAuthWebFilterTest`：真实 Netty——开放路由无令牌/坏令牌放行且无身份头、有效令牌带验签身份；内部路由无令牌/坏签名/他密钥/alg 伪造/过期（含压点）/缺声明/非 Bearer 全 401 且文案统一；伪造身份头/戳先剥后写；混用同链路不互相误伤；`/api` 不剥不盖；traceId 沿用。
+- `UserAuthFullChainTest`：CORS + 登录鉴权 + 转发三过滤器串真实上游——上游只收验签身份与网关戳、收不到 Authorization，预检在鉴权前答复、响应放行三个透传头给 JS。
+- `UserAuthEnabledSmokeTest` / `UserAuthDisabledSmokeTest`：开关开时整套（验签器/签发器/戳/CORS/鉴权过滤器）装配，关时无功能 bean、上下文照常起。
 - `GatewayProxyIT`：真实容器 + 真实 Redis + 真实上游，建完路由立刻能转发、删完立刻失效；探不到 Redis 时自动跳过。
 
 ## 已知边界（留给后续题目）
@@ -348,4 +443,6 @@ mvn test
 - 多实例间的配置即时一致目前靠 10s 定时轮询兜底（本实例内是事件即时）；要做到跨实例秒级一致可接 Redis Pub/Sub。接入凭据/名单同理。
 - 密钥目前只在创建时发放，没有「重新签发/轮换密钥」接口；遗失或泄露后需要时再加（数据模型已留散列字段，换发即覆盖）。
 - 鉴权被拒（401/403）的请求在匹配路由、转发之前就结束，因此不进 `gw_access_log` 流水表（也不产生文件式访问日志的 OUT 段）；若安全审计要统计「撞密钥/撞来路」的尝试，需要在鉴权过滤器内单独留一条拒绝审计。
+- 用户登录令牌目前提供 `JwtUserToken.Signer`（容器内 bean，与网关共享令牌密钥的签发侧/运维工具可直接用），**还没有「登录换令牌」的对外接口**（校验账号密码、刷新、登出黑名单留给后续题目）；当前口径是令牌由共享密钥的签发方造好交给调用方。
+- 用户/租户标识写进头前过白名单（ASCII 安全字符，≤256）；若用户标识含非 ASCII（如中文昵称），请在令牌里放 ASCII 的用户 ID 而不是展示名（HTTP 头本就不可靠承载非 ASCII）。
 - 动作目前只支持请求/响应头的补与删；路径改写、查询串改写、体改写等留给后续。

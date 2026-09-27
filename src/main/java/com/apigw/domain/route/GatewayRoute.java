@@ -23,6 +23,10 @@ import java.util.regex.Pattern;
  * 4. 同一组的子项顺序号必须从 1 起、连续、不重，撞号要报出是哪两条撞的；
  * 5. 类型/方向/必填项由 {@link GatewayRule#validateAs} 守住。
  *
+ * requireLogin 是「这条路由要不要登录」的路由级开关，跟着路由配置一起存、一起热刷新：
+ * 0（默认）= 开放路由，谁都能打，没带令牌照常放行；1 = 内部路由，必须带一张验签通过、
+ * 没过期、信息齐全的令牌。只认 0 / 1，空值按 0（开放）处理。
+ *
  * version 承载乐观锁语义：并发保存同一条路由时，旧版本提交会被拒。
  */
 @Getter
@@ -46,6 +50,12 @@ public class GatewayRoute {
     /** 1 启用 / 0 停用。 */
     private Integer enabled;
 
+    /**
+     * 1 = 该路由必须登录（带有效令牌）；0（默认）= 开放路由，无令牌也放行。
+     * 标记跟着路由配置持久化，与启用开关互不影响（停用的路由本来就不参与匹配）。
+     */
+    private Integer requireLogin;
+
     private String remark;
 
     /** 乐观锁版本号。 */
@@ -59,11 +69,17 @@ public class GatewayRoute {
 
     public static GatewayRoute create(String routeNo, String name, String upstream,
                                       Integer enabled, String remark) {
+        return create(routeNo, name, upstream, enabled, 0, remark);
+    }
+
+    public static GatewayRoute create(String routeNo, String name, String upstream,
+                                      Integer enabled, Integer requireLogin, String remark) {
         GatewayRoute route = new GatewayRoute();
         route.assignRouteNo(routeNo);
         route.rename(name);
         route.changeUpstream(upstream);
         route.changeEnabled(enabled);
+        route.changeRequireLogin(requireLogin);
         route.setRemark(remark);
         route.setVersion(0);
         route.setConditions(new ArrayList<>());
@@ -107,6 +123,31 @@ public class GatewayRoute {
             throw new BizException("启用开关只能是 0（停用）或 1（启用），收到的是：" + enabled);
         }
         this.enabled = enabled;
+    }
+
+    /**
+     * 登录开关只认 0（开放，默认）/ 1（必须登录）；空值按开放处理，其余值一律不收。
+     * 不直接用 Lombok 生成的 setter，就是为了把「只认 0/1」这道关收在聚合里。
+     */
+    public void changeRequireLogin(Integer requireLogin) {
+        if (requireLogin == null) {
+            this.requireLogin = 0;
+            return;
+        }
+        if (requireLogin != 0 && requireLogin != 1) {
+            throw new BizException("登录开关只能是 0（开放）或 1（必须登录），收到的是：" + requireLogin);
+        }
+        this.requireLogin = requireLogin;
+    }
+
+    /** 语义化判断：这条路由要不要先登录。 */
+    public boolean isLoginRequired() {
+        return Integer.valueOf(1).equals(requireLogin);
+    }
+
+    /** 钉住 Lombok 可能生成的 setter：任何赋值路径都得过 {@link #changeRequireLogin} 的校验。 */
+    public void setRequireLogin(Integer requireLogin) {
+        changeRequireLogin(requireLogin);
     }
 
     /**

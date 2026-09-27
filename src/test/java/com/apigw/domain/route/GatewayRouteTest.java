@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,6 +46,40 @@ class GatewayRouteTest {
         BizException e = assertThrows(BizException.class,
                 () -> GatewayRoute.create("r", "n", "http://h:1", 5, null));
         assertTrue(e.getMessage().contains("启用开关只能是 0（停用）或 1（启用）"), e.getMessage());
+    }
+
+    @Test
+    void requireLogin_defaultsToOpen_whenNull() {
+        GatewayRoute r = GatewayRoute.create("r", "n", "http://h:1", 1, null, null);
+        assertEquals(0, r.getRequireLogin());
+        assertFalse(r.isLoginRequired());
+        // 旧的 5 参工厂也默认开放
+        assertFalse(GatewayRoute.create("r", "n", "http://h:1", 1, null).isLoginRequired());
+    }
+
+    @Test
+    void requireLogin_oneMeansLoginRequired_zeroMeansOpen() {
+        GatewayRoute login = GatewayRoute.create("r", "n", "http://h:1", 1, 1, null);
+        assertTrue(login.isLoginRequired());
+        GatewayRoute open = GatewayRoute.create("r", "n", "http://h:1", 1, 0, null);
+        assertFalse(open.isLoginRequired());
+    }
+
+    @Test
+    void requireLogin_rejectsOtherValues() {
+        BizException e = assertThrows(BizException.class,
+                () -> GatewayRoute.create("r", "n", "http://h:1", 1, 2, null));
+        assertTrue(e.getMessage().contains("登录开关只能是 0（开放）或 1（必须登录）"), e.getMessage());
+    }
+
+    @Test
+    void requireLogin_setterAlsoEnforcesValidation() {
+        GatewayRoute r = base();
+        r.setRequireLogin(1);
+        assertTrue(r.isLoginRequired());
+        r.setRequireLogin(null);
+        assertFalse(r.isLoginRequired());
+        assertThrows(BizException.class, () -> r.setRequireLogin(9));
     }
 
     @Test

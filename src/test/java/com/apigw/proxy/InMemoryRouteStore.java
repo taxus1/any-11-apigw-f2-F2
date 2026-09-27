@@ -12,15 +12,15 @@ import java.util.List;
  * 转发链路测试用的「内存版」路由仓库：直接拿一组 GatewayRoute 当快照源，
  * 想模拟「新建/删除路由热生效」时替换列表后让 catalog 刷新即可，不依赖 Redis。
  */
-class InMemoryRouteStore extends RouteStore {
+public class InMemoryRouteStore extends RouteStore {
 
     private volatile List<GatewayRoute> routes = new ArrayList<>();
 
-    InMemoryRouteStore() {
+    public InMemoryRouteStore() {
         super(null, new com.fasterxml.jackson.databind.ObjectMapper());
     }
 
-    void setRoutes(List<GatewayRoute> routes) {
+    public void setRoutes(List<GatewayRoute> routes) {
         this.routes = new ArrayList<>(routes);
     }
 
