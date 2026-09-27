@@ -49,6 +49,23 @@ apigw:
     enabled: ${APP_AUTH_ENABLED:false}
     refresh-interval: 10s
     refresh-interval-ms: 10000
+  # 用户登录令牌鉴权（自签 JWT，算法钉死 HS256）。
+  # 密钥只走环境变量/外部配置，绝不写进仓库；默认空 = 未启用：
+  #   - 开放路由（authRequired=0）照常转发；
+  #   - 需登录路由（authRequired=1）在未配密钥时 fail-closed 回 503，绝不裸放行。
+  # token-secret：验令牌签名；pass-secret：盖 X-Gateway-Pass 通行标记（与上游共享，缺省回退 token-secret）。
+  # 过期判定零宽限：now >= exp 即过期，正好压点也按过期处理，没有宽限期可配。
+  user-auth:
+    token-secret: ${USER_AUTH_TOKEN_SECRET:}
+    pass-secret: ${USER_AUTH_PASS_SECRET:}
+    issuer: ${USER_AUTH_ISSUER:}
+  # 跨域：默认任意来源、不带 Cookie 凭证（令牌走 Authorization 头）；生产请把来源收敛成自己的页面。
+  # 前端跨域要读的身份头/追踪号/错误标识在 exposed-headers 里默认放行，Authorization 在允许请求头内。
+  cors:
+    enabled: ${CORS_ENABLED:true}
+    allowed-origins:
+      - ${CORS_ALLOWED_ORIGINS:*}
+    max-age: 1h
 
 logging:
   level:

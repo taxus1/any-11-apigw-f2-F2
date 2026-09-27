@@ -212,6 +212,7 @@ public class RouteStore {
         public String name;
         public String upstream;
         public Integer enabled;
+        public Integer authRequired;
         public String remark;
         public Integer version;
         public List<RuleDto> conditions = new ArrayList<>();
@@ -224,6 +225,7 @@ public class RouteStore {
             d.name = r.getName();
             d.upstream = r.getUpstream();
             d.enabled = r.getEnabled();
+            d.authRequired = r.getAuthRequired();
             d.remark = r.getRemark();
             d.version = r.getVersion();
             d.conditions = r.getConditions().stream().map(RuleDto::from).toList();
@@ -233,6 +235,8 @@ public class RouteStore {
 
         GatewayRoute toDomain() {
             GatewayRoute r = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
+            // 旧配置里没有这个字段：null 进 changeAuthRequired 按 0（开放）落，向后兼容
+            r.changeAuthRequired(authRequired);
             r.setId(id);
             r.setVersion(version == null ? 0 : version);
             r.replaceRules(

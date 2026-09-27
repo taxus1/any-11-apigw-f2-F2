@@ -1,7 +1,9 @@
 package com.apigw.proxy.forward;
 
+import com.apigw.common.web.GatewayHeaders;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.proxy.action.HeaderActionApplier;
+import com.apigw.proxy.userauth.OutboundAuth;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.server.reactive.ServerHttpRequest;
@@ -26,9 +28,13 @@ import java.util.function.Function;
  *    只对「调用方↔网关」这一段有意义，不能转发给上游；
  *    Content-Length / Transfer-Encoding 与即将发出的报文绑定，交给 HTTP 客户端按实际请求体重算；
  *    Host 也不能沿用，客户端按目标上游地址重新生成；
- * 2. 补 X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host，让上游看得到原始链路信息；
- * 3. 按顺序号执行本路由的请求类动作（补头覆盖同名旧值、删头彻底删除）；
- * 4. 请求体以数据流形式透传，不在网关里全量缓冲（大文件也只过一遍内存）。
+ * 2. 清掉网关独占的身份/通行头（X-User-Id / X-Tenant-Id / X-Gateway-Pass）：
+ *    这几个头只由网关按验签结果写入，调用方在入站塞的同名头一律视为伪造、先清干净；
+ *    用户鉴权启用时连 Authorization 一起剥掉——原始令牌不原样递上游；
+ * 3. 补 X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host，让上游看得到原始链路信息；
+ * 4. 写入网关认定的身份头与通行标记（来自 {@link OutboundAuth}，没验出身份就一个都不写）；
+ * 5. 按顺序号执行本路由的请求类动作（补头覆盖同名旧值、删头彻底删除）；
+ * 6. 请求体以数据流形式透传，不在网关里全量缓冲（大文件也只过一遍内存）。
  */
 @Component
 public class UpstreamForwarder {
@@ -57,9 +63,9 @@ public class UpstreamForwarder {
      *                        通常负责头清洗、响应动作、写回调用方
      */
     public Mono<Void> forward(GatewayRoute route, ServerHttpRequest incoming,
-                              String traceId, URI targetUri,
+                              String traceId, URI targetUri, OutboundAuth auth,
                               Function<UpstreamResponse, Mono<Void>> responseHandler) {
-        ServerHttpRequest mutated = prepareRequest(route, incoming, traceId);
+        ServerHttpRequest mutated = prepareRequest(route, incoming, traceId, auth);
 
         WebClient.RequestBodySpec spec = webClient
                 .method(HttpMethod.valueOf(incoming.getMethod().name()))
@@ -97,8 +103,9 @@ public class UpstreamForwarder {
         return URI.create(sb.toString());
     }
 
-    /** 构造发往上游的请求：头清洗 → X-Forwarded-* → 请求动作。 */
-    private ServerHttpRequest prepareRequest(GatewayRoute route, ServerHttpRequest incoming, String traceId) {
+    /** 构造发往上游的请求：头清洗 → 独占头清零 → X-Forwarded-* → 身份/通行头 → 请求动作。 */
+    private ServerHttpRequest prepareRequest(GatewayRoute route, ServerHttpRequest incoming,
+                                             String traceId, OutboundAuth auth) {
         return incoming.mutate().headers(headers -> {
             // 1. 剔除逐跳头与报文绑定头（头名大小写不敏感，统一小写比对）
             HOP_BY_HOP.forEach(headers::remove);
@@ -109,7 +116,18 @@ public class UpstreamForwarder {
                 headers.set("te", HttpHeaderValues.TRAILERS.toString());
             }
 
-            // 2. 透传原始链路信息（先加，动作如果想覆盖可以再覆盖）
+            // 2. 网关独占头清零：身份头/通行标记只由网关写。调用方塞的同名头先全部清掉，
+            //    再按网关验签结果写——伪造身份一个字都到不了上游（在动作之前清，运营显式配置的
+            //    补头动作仍可覆盖，那是配置侧的明确选择，不是调用方能影响的）
+            headers.remove(GatewayHeaders.USER_ID_HEADER);
+            headers.remove(GatewayHeaders.TENANT_ID_HEADER);
+            headers.remove(GatewayHeaders.GATEWAY_PASS_HEADER);
+            if (auth.stripAuthorization()) {
+                // 用户鉴权启用：原始令牌只在「调用方↔网关」这段有效，绝不原样递上游
+                headers.remove(GatewayHeaders.AUTHORIZATION_HEADER);
+            }
+
+            // 3. 透传原始链路信息（先加，动作如果想覆盖可以再覆盖）
             String remote = incoming.getRemoteAddress() == null
                     ? null : incoming.getRemoteAddress().getAddress().getHostAddress();
             if (remote != null) {
@@ -125,7 +143,16 @@ public class UpstreamForwarder {
             }
             headers.set("X-Gateway-Trace-Id", traceId);
 
-            // 3. 请求类动作按顺序号执行；补头覆盖同名值（包括调用方自己塞的），删头彻底删除
+            // 4. 网关认定的身份与通行标记：只有验签后有值才写，匿名就没有这些头
+            if (auth.identity() != null) {
+                headers.set(GatewayHeaders.USER_ID_HEADER, auth.identity().userId());
+                headers.set(GatewayHeaders.TENANT_ID_HEADER, auth.identity().tenantId());
+            }
+            if (auth.gatewayPass() != null) {
+                headers.set(GatewayHeaders.GATEWAY_PASS_HEADER, auth.gatewayPass());
+            }
+
+            // 5. 请求类动作按顺序号执行；补头覆盖同名值（包括调用方自己塞的），删头彻底删除
             HeaderActionApplier.applyRequestActions(route, headers);
         }).build();
     }

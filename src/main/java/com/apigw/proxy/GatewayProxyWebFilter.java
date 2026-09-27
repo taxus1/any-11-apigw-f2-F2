@@ -5,6 +5,7 @@ import com.apigw.common.web.GatewayHeaders;
 import com.apigw.domain.accesslog.AccessLogEntry;
 import com.apigw.domain.accesslog.AccessLogSink;
 import com.apigw.domain.route.GatewayRoute;
+import com.apigw.domain.userauth.UserIdentity;
 import com.apigw.proxy.accesslog.AccessLogRecorder;
 import com.apigw.proxy.action.HeaderActionApplier;
 import com.apigw.proxy.error.GatewayErrors;
@@ -13,6 +14,9 @@ import com.apigw.proxy.forward.UpstreamForwarder;
 import com.apigw.proxy.forward.UpstreamResponse;
 import com.apigw.proxy.match.RouteMatcher;
 import com.apigw.proxy.route.RouteCatalog;
+import com.apigw.proxy.userauth.OutboundAuth;
+import com.apigw.proxy.userauth.UserAuthGatekeeper;
+import com.apigw.domain.userauth.UserTokenVerifier;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.Ordered;
@@ -77,19 +81,22 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
     private final AccessLogRecorder accessLog;
     private final AccessLogSink accessLogSink;
     private final ObjectMapper objectMapper;
+    private final UserAuthGatekeeper userAuth;
 
     public GatewayProxyWebFilter(RouteCatalog routeCatalog,
                                  RouteMatcher routeMatcher,
                                  UpstreamForwarder forwarder,
                                  AccessLogRecorder accessLog,
                                  AccessLogSink accessLogSink,
-                                 ObjectMapper objectMapper) {
+                                 ObjectMapper objectMapper,
+                                 UserAuthGatekeeper userAuth) {
         this.routeCatalog = routeCatalog;
         this.routeMatcher = routeMatcher;
         this.forwarder = forwarder;
         this.accessLog = accessLog;
         this.accessLogSink = accessLogSink;
         this.objectMapper = objectMapper;
+        this.userAuth = userAuth;
     }
 
     @Override
@@ -138,12 +145,49 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                         return GatewayErrors.write(exchange, objectMapper,
                                 UpstreamFailureKind.NO_ROUTE, traceId, null);
                     }
+
+                    // 登录鉴权（标记跟着路由走，一条一配）。开放路由与受保护路由走同一套链路：
+                    // - 受保护路由：必须带一张验得过的令牌（签名真/没过期/信息全），任何一样不过都 401；
+                    // - 开放路由：不拦人，令牌只是可选的身份补充，验不过按匿名放行（口径见 README）。
+                    //   身份头由转发器无条件先清后写，所以坏令牌不会往上游泄露任何伪造身份。
+                    UserIdentity identity;
+                    if (route.requiresAuth()) {
+                        if (!userAuth.tokenVerificationEnabled()) {
+                            // 配了「需登录」却没配验签密钥：配置事故，fail-closed，绝不裸放行
+                            log.warn("路由 {} 要求登录，但未配置用户令牌验签密钥 traceId={}",
+                                    route.getRouteNo(), traceId);
+                            outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(),
+                                    UpstreamFailureKind.USER_AUTH_CONFIG_UNAVAILABLE.errorCode()));
+                            return GatewayErrors.write(exchange, objectMapper,
+                                    UpstreamFailureKind.USER_AUTH_CONFIG_UNAVAILABLE, traceId, null);
+                        }
+                        String token = userAuth.extractBearerToken(exchange.getRequest());
+                        if (token == null) {
+                            log.debug("登录鉴权拒绝 reason=MISSING_TOKEN route={} traceId={}",
+                                    route.getRouteNo(), traceId);
+                            return rejectUserUnauthorized(exchange, route, traceId, outcome);
+                        }
+                        UserTokenVerifier.Result checked = userAuth.verify(token);
+                        if (!checked.ok()) {
+                            // 具体原因（签名错/过期/声明不全）只在服务端日志，不回给调用方
+                            log.debug("登录鉴权拒绝 reason={} route={} traceId={}",
+                                    checked.failure(), route.getRouteNo(), traceId);
+                            return rejectUserUnauthorized(exchange, route, traceId, outcome);
+                        }
+                        identity = checked.identity();
+                    } else {
+                        identity = userAuth.tryVerifyIdentity(exchange.getRequest());
+                    }
+
                     outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(), "FORWARDED"));
                     URI targetUri = UpstreamForwarder.resolveTargetUri(
                             route.getUpstream(), exchange.getRequest());
+                    OutboundAuth outboundAuth = userAuth.outbound(
+                            traceId, exchange.getRequest(), identity);
                     // 响应处理必须在 WebClient 的 exchangeToMono 回调内完成（此时仍持有上游连接），
                     // 所以把 writeUpstreamResponse 作为 handler 传进去
                     return forwarder.forward(route, exchange.getRequest(), traceId, targetUri,
+                            outboundAuth,
                             upstream -> writeUpstreamResponse(exchange, route, upstream))
                             .onErrorResume(err -> {
                                 UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
@@ -224,6 +268,19 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         // 服务端日志留全证据（含堆栈）；调用方只拿得到 kind 的固定文案，拿不到这行
         log.warn("转发失败 kind={} traceId={}", kind.errorCode(), traceId, detail);
         return GatewayErrors.write(exchange, objectMapper, kind, traceId, detail);
+    }
+
+    /**
+     * 登录鉴权不过：统一回 401 USER_UNAUTHENTICATED。缺令牌、签名错、过期、声明不全对外都是
+     * 同一句固定文案（不区分），避免把校验细节与令牌长什么样漏给调用方。
+     * 这里已经匹配到路由，结果照常进访问日志（命中路由 + 401）。
+     */
+    private Mono<Void> rejectUserUnauthorized(ServerWebExchange exchange, GatewayRoute route,
+                                              String traceId, AtomicReference<Outcome> outcome) {
+        outcome.set(new Outcome(route.getRouteNo(), route.getUpstream(),
+                UpstreamFailureKind.USER_UNAUTHENTICATED.errorCode()));
+        return GatewayErrors.write(exchange, objectMapper,
+                UpstreamFailureKind.USER_UNAUTHENTICATED, traceId, null);
     }
 
     private boolean isPassthrough(String path) {

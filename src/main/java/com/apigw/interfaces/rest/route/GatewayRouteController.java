@@ -90,7 +90,7 @@ public class GatewayRouteController {
         List<GatewayRule> actions = body.actions() == null ? List.of()
                 : body.actions().stream().map(GatewayRouteController::toRule).toList();
         return appService.assemble(body.routeNo(), body.name(), body.upstream(),
-                body.enabled(), body.remark(), body.version(), conditions, actions);
+                body.enabled(), body.authRequired(), body.remark(), body.version(), conditions, actions);
     }
 
     private static GatewayRule toRule(RouteSaveVO.RuleVO vo) {

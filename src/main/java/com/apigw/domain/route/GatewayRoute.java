@@ -46,6 +46,12 @@ public class GatewayRoute {
     /** 1 启用 / 0 停用。 */
     private Integer enabled;
 
+    /**
+     * 登录开关：1 = 需登录（调用方必须带一张网关验得过的用户令牌），
+     * 0 = 开放（谁都能打，没令牌也照常放行）。缺省 0——这个标记跟着路由配置走，一条一配。
+     */
+    private Integer authRequired;
+
     private String remark;
 
     /** 乐观锁版本号。 */
@@ -64,6 +70,8 @@ public class GatewayRoute {
         route.rename(name);
         route.changeUpstream(upstream);
         route.changeEnabled(enabled);
+        // 默认开放：登录是「随路由单独打开」的开关，不打开就谁都能打
+        route.changeAuthRequired(0);
         route.setRemark(remark);
         route.setVersion(0);
         route.setConditions(new ArrayList<>());
@@ -107,6 +115,23 @@ public class GatewayRoute {
             throw new BizException("启用开关只能是 0（停用）或 1（启用），收到的是：" + enabled);
         }
         this.enabled = enabled;
+    }
+
+    /** 登录开关只认 0（开放）/ 1（需登录），null 按开放默认，别的值不收。 */
+    public void changeAuthRequired(Integer authRequired) {
+        if (authRequired == null) {
+            this.authRequired = 0;
+            return;
+        }
+        if (authRequired != 0 && authRequired != 1) {
+            throw new BizException("登录开关只能是 0（开放）或 1（需登录），收到的是：" + authRequired);
+        }
+        this.authRequired = authRequired;
+    }
+
+    /** 这条路由是否要求登录。 */
+    public boolean requiresAuth() {
+        return authRequired != null && authRequired == 1;
     }
 
     /**

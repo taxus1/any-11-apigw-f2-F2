@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,6 +46,31 @@ class GatewayRouteTest {
         BizException e = assertThrows(BizException.class,
                 () -> GatewayRoute.create("r", "n", "http://h:1", 5, null));
         assertTrue(e.getMessage().contains("启用开关只能是 0（停用）或 1（启用）"), e.getMessage());
+    }
+
+    @Test
+    void authRequired_defaultsToOpen() {
+        GatewayRoute r = base();
+        assertEquals(0, r.getAuthRequired());
+        assertFalse(r.requiresAuth());
+    }
+
+    @Test
+    void authRequired_canBeSwitchedOn() {
+        GatewayRoute r = base();
+        r.changeAuthRequired(1);
+        assertEquals(1, r.getAuthRequired());
+        assertTrue(r.requiresAuth());
+        // null 按开放默认
+        r.changeAuthRequired(null);
+        assertFalse(r.requiresAuth());
+    }
+
+    @Test
+    void authRequired_rejectsOtherValues() {
+        GatewayRoute r = base();
+        BizException e = assertThrows(BizException.class, () -> r.changeAuthRequired(2));
+        assertTrue(e.getMessage().contains("登录开关只能是 0（开放）或 1（需登录）"), e.getMessage());
     }
 
     @Test

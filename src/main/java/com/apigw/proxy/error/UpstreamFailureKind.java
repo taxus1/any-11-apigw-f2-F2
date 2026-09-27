@@ -35,6 +35,13 @@ public enum UpstreamFailureKind {
             "应用已停用或来源地址不在来路名单内，网关拒绝本次调用"),
     APP_CONFIG_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "APP_CONFIG_UNAVAILABLE",
             "接入鉴权配置暂时不可用，请稍后重试"),
+
+    /** 用户令牌（JWT）缺带/签名错/过期/声明不全：对外统一文案，不透露是哪一项不过。 */
+    USER_UNAUTHENTICATED(HttpStatus.UNAUTHORIZED, "USER_UNAUTHENTICATED",
+            "需要登录：请携带网关签发的有效令牌（Authorization: Bearer <token>）"),
+    /** 路由要求登录，但网关此刻不具备验签条件（没配密钥）：fail-closed，绝不裸放行。 */
+    USER_AUTH_CONFIG_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "USER_AUTH_CONFIG_UNAVAILABLE",
+            "登录鉴权配置暂时不可用，请稍后重试"),
     NO_ROUTE(HttpStatus.NOT_FOUND, "NO_ROUTE",
             "网关未匹配到路由：该请求没有对应的转发规则"),
     UPSTREAM_UNAVAILABLE(HttpStatus.BAD_GATEWAY, "UPSTREAM_UNAVAILABLE",

@@ -140,6 +140,40 @@ class GatewayRouteControllerWebTest {
     }
 
     @Test
+    void create_withAuthRequired_roundTrips_andDefaultsToOpen() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        // 显式打开登录开关：详情回 1
+        var withAuth = body("sec-01", "n", "http://h:8080", null,
+                List.of(rule("PATH_PREFIX", null, "/a/", 1)), List.of());
+        withAuth.put("authRequired", 1);
+        web.post().uri("/api/gateway/routes").bodyValue(withAuth)
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.authRequired").isEqualTo(1);
+
+        // 不传：默认开放（0），且列表行也带这个字段
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(body("open-01", "n", "http://h:8080", null,
+                        List.of(rule("PATH_PREFIX", null, "/b/", 1)), List.of()))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.authRequired").isEqualTo(0);
+    }
+
+    @Test
+    void create_illegalAuthRequired_rejected() {
+        var illegal = body("sec-02", "n", "http://h:8080", null,
+                List.of(rule("PATH_PREFIX", null, "/a/", 1)), List.of());
+        illegal.put("authRequired", 2);
+        web.post().uri("/api/gateway/routes").bodyValue(illegal)
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("登录开关只能是 0（开放）或 1（需登录）"));
+    }
+
+    @Test
     void update_routeNoMismatch_rejected() {
         web.put().uri("/api/gateway/routes/order-01")
                 .bodyValue(body("order-02", "n", "http://h:8080", 0,

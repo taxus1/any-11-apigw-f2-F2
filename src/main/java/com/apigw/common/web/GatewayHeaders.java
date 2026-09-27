@@ -24,6 +24,23 @@ public final class GatewayHeaders {
     /** 应用密钥头：只用于网关当次比对散列，绝不写日志/落库。 */
     public static final String APP_SECRET_HEADER = "X-App-Secret";
 
+    /**
+     * 调用方携带用户令牌的入站头：{@code Authorization: Bearer <token>}。
+     * 网关验过之后令牌本身不原样转发，上游只看下面两个身份头。
+     */
+    public static final String AUTHORIZATION_HEADER = "Authorization";
+
+    /**
+     * 网关写向上游的身份头（出站）：用户标识、租户标识。
+     * 这两个头与通行标记由网关<b>独占</b>：入站请求里若带同名头，转发前一律先清掉，
+     * 再按网关自己验签的结果写入——调用方塞的假身份一个字都到不了上游。
+     */
+    public static final String USER_ID_HEADER = "X-User-Id";
+    public static final String TENANT_ID_HEADER = "X-Tenant-Id";
+
+    /** 网关盖的通行标记（出站）：上游据此确认这笔请求确实过了网关。 */
+    public static final String GATEWAY_PASS_HEADER = "X-Gateway-Pass";
+
     /** 追踪号：字母数字与 . _ -，长度 8..64（覆盖常见 trace/span 号与 UUID）。 */
     private static final Pattern TRACE_ID_PATTERN = Pattern.compile("[A-Za-z0-9._-]{8,64}");
 
